@@ -263,11 +263,10 @@ static void process_other_json(const char *buffer, size_t size)
                 }
                 send_device_state();
             } else if (state == "sentence_start") {
-                // 取出"text", 通知GUI
+                // 取出"text", 通知 GUI 显示 AI 正在说的话
                 // {"type":"tts","state":"sentence_start","text":"1加1等于2啦~","session_id":"eae53ada"}
                 auto text = j["text"];
                 send_stt(text.get<std::string>());
-                send_start_listening_req(kListeningModeAutoStop);
                 set_device_state(kDeviceStateSpeaking);
                 send_device_state();
             }
