@@ -1,6 +1,6 @@
 # sudo apt-get install libopus-dev libavresample-dev libswresample-dev libspeexdsp-dev
 
-objs := control_center.o websocket_client.o ipc_udp.o http.o uuid.o
+objs := control_center.o websocket_client.o ipc_udp.o http.o uuid.o gpio_button.o
 
 app = control_center
 all: ${app}

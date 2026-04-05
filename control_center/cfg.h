@@ -6,6 +6,7 @@
 #define UI_PORT_UP    5678      /* GUI向control_center的这个端口上传UI信息 */
 #define UI_PORT_DOWN  5679      /* control_center向GUI的这个端口下发UI信息 */
 
+#define GPIO_PIN_BUTTON 17      /* GPIO17 按钮引脚 */
 
 #define CFG_FILE "/etc/xiaozhi.cfg"
 

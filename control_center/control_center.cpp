@@ -36,6 +36,7 @@
 #include <random>
 #include <sstream>
 #include <iomanip>
+#include <atomic>
 
 // Include nlohmann/json library
 #include "json.hpp"
@@ -45,9 +46,13 @@
 #include "uuid.h"
 
 #include "cfg.h"
+#include "gpio_button.h"
 
 using json = nlohmann::json;
-static int g_audio_upload_enable = 1;
+// g_button_mic_active: 按钮状态（GPIO 控制），1=用户已按下开启对话，0=关闭
+std::atomic<int> g_button_mic_active{0};
+// g_tts_active: TTS 播放压制标志（TTS 状态机控制），1=正在播放不应上传
+static std::atomic<int> g_tts_active{0};
 static std::string g_session_id;
 
 typedef enum ListeningMode {
@@ -81,6 +86,7 @@ static void set_device_state(DeviceState state)
 
 static void send_device_state(void)
 {
+    if (!g_ipc_ep_ui) return;
     std::string stateString = "{\"state\":" + std::to_string(g_device_state) + "}";
     g_ipc_ep_ui->send(g_ipc_ep_ui, stateString.data(), stateString.size());
 }
@@ -142,10 +148,22 @@ static void send_start_listening_req(ListeningMode mode)
     try {
         //c->send(hdl, startString, websocketpp::frame::opcode::text);
         websocket_send_text(startString.data(), startString.size());
-        std::cout << "Send: " << startString << std::endl;    
+        std::cout << "Send: " << startString << std::endl;
     } catch (const websocketpp::lib::error_code& e) {
         std::cout << "Error sending message: " << e << " (" << e.message() << ")" << std::endl;
-    }     
+    }
+}
+
+static void send_stop_listening_req(void)
+{
+    std::string stopString = "{\"session_id\":\"" + g_session_id + "\"";
+    stopString += ",\"type\":\"listen\",\"state\":\"stop\"}";
+    try {
+        websocket_send_text(stopString.data(), stopString.size());
+        std::cout << "Send: " << stopString << std::endl;
+    } catch (const websocketpp::lib::error_code& e) {
+        std::cout << "Error sending message: " << e << " (" << e.message() << ")" << std::endl;
+    }
 }
 
 static void process_hello_json(const char *buffer, size_t size)
@@ -198,23 +216,13 @@ static void process_hello_json(const char *buffer, size_t size)
         std::cout << "Error sending message: " << e << " (" << e.message() << ")" << std::endl;
     }			
 
-    std::string startString = R"(
-        {"session_id":"","type":"listen","state":"start","mode":"auto"}
-    )";
-    
-    try {
-        //c->send(hdl, startString, websocketpp::frame::opcode::text);
-        websocket_send_text(startString.data(), startString.size());
-        std::cout << "Send: " << startString << std::endl;    
-    } catch (const websocketpp::lib::error_code& e) {
-        std::cout << "Error sending message: " << e << " (" << e.message() << ")" << std::endl;
-    }            
-
     std::string state = R"(
         {"session_id":"","type":"iot","update":true,"states":[{"name":"Speaker","state":{"volume":80}},{"name":"Backlight","state":{"brightness":75}},{"name":"Battery","state":{"level":0,"charging":false}}]}
     )";
-    
-    g_audio_upload_enable = 1;
+
+    // 新会话建立，重置状态；等待用户按下按钮才开始监听
+    g_button_mic_active = 0;
+    g_tts_active = 0;
 
     try {
         //c->send(hdl, state, websocketpp::frame::opcode::text);
@@ -237,18 +245,23 @@ static void process_other_json(const char *buffer, size_t size)
         if (j["type"] == "tts") {
             auto state = j["state"];
             if (state == "start") {
-                // 下发语音, 可以关闭录音
-                g_audio_upload_enable = 0;
+                // 下发语音，TTS 压制录音上传
+                g_tts_active = 1;
                 set_device_state(kDeviceStateListening);
                 send_device_state();
             } else if (state == "stop") {
-                // 本次交互结束, 可以继续上传声音
+                // TTS 播放结束，解除压制
                 // 等待一会以免她听到自己的话误以为再次对话
                 sleep(2);
-                send_start_listening_req(kListeningModeAutoStop);
-                set_device_state(kDeviceStateListening);
+                g_tts_active = 0;
+                // 只有用户按钮仍处于激活状态才重新开始监听
+                if (g_button_mic_active) {
+                    send_start_listening_req(kListeningModeAutoStop);
+                    set_device_state(kDeviceStateListening);
+                } else {
+                    set_device_state(kDeviceStateIdle);
+                }
                 send_device_state();
-                g_audio_upload_enable = 1;
             } else if (state == "sentence_start") {
                 // 取出"text", 通知GUI
                 // {"type":"tts","state":"sentence_start","text":"1加1等于2啦~","session_id":"eae53ada"}
@@ -337,7 +350,7 @@ int process_opus_data_uploaded(char *buffer, size_t size, void *user_data)
         fprintf(stderr, "Failed to open file %s for writing\n", filename);
     }   
 #endif
-    if (g_audio_upload_enable) {
+    if (g_button_mic_active && !g_tts_active) {
         static int cnt = 0;
         if ((cnt++ % 100) == 0)
             std::cout << "Send opus data to server: " << size <<" count: "<< cnt << std::endl;
@@ -349,6 +362,31 @@ int process_opus_data_uploaded(char *buffer, size_t size, void *user_data)
 int process_ui_data(char *buffer, size_t size, void *user_data)
 {
     return 0;
+}
+
+/**
+ * GPIO 按钮按下回调
+ *
+ * 第一次按下：发送 listen start，进入监听状态
+ * 第二次按下：发送 listen stop，回到空闲状态
+ */
+static void on_gpio_button_press(void)
+{
+    if (g_session_id.empty()) {
+        printf("Button pressed: WebSocket not ready yet, ignored\n");
+        return;
+    }
+    g_button_mic_active ^= 1;
+    if (g_button_mic_active) {
+        printf("Button pressed: start listening\n");
+        send_start_listening_req(kListeningModeAutoStop);
+        set_device_state(kDeviceStateListening);
+    } else {
+        printf("Button pressed: stop listening\n");
+        send_stop_listening_req();
+        set_device_state(kDeviceStateIdle);
+    }
+    send_device_state();
 }
 
 /**
@@ -442,6 +480,13 @@ int main(int argc, char **argv)
 
     g_ipc_ep_audio = ipc_endpoint_create_udp(AUDIO_PORT_UP, AUDIO_PORT_DOWN, process_opus_data_uploaded, NULL);
     g_ipc_ep_ui = ipc_endpoint_create_udp(UI_PORT_UP, UI_PORT_DOWN, process_ui_data, NULL);
+
+    // 创建 GPIO 按钮监控线程
+    gpio_button_set_press_callback(on_gpio_button_press);
+    pthread_t gpio_thread = create_gpio_button_thread(GPIO_PIN_BUTTON);
+    if (!gpio_thread) {
+        std::cerr << "Failed to create GPIO button thread" << std::endl;
+    }
 
     http_data_t http_data;
     http_data.url = "https://api.tenclass.net/xiaozhi/ota/";
